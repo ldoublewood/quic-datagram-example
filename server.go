@@ -7,29 +7,23 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/binary"
+	"flag"
 	"fmt"
 	"log"
 	"math/big"
 	"net"
-	"sync"
 	"time"
 
+	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/network"
+	tpt "github.com/libp2p/go-libp2p/core/transport"
+	"github.com/libp2p/go-libp2p/p2p/transport/quicreuse"
 	"github.com/quic-go/quic-go"
 )
 
-type PacketStats struct {
-	ReceivedCount int64
-	LostCount     int64
-	TotalLatency  time.Duration
-	MinLatency    time.Duration
-	MaxLatency    time.Duration
-	LastSeqNum    uint64
-}
-
 type Server struct {
-	stats PacketStats
-	mutex sync.RWMutex
+	stats ServerStats
+	mode  string
 }
 
 func generateTLSConfig() *tls.Config {
@@ -64,7 +58,7 @@ func generateTLSConfig() *tls.Config {
 	}
 }
 
-func (s *Server) handleConnection(conn quic.Connection) {
+func (s *Server) handleConnection(conn Connection) {
 	fmt.Printf("客户端连接: %s\n", conn.RemoteAddr())
 
 	ctx := context.Background()
@@ -76,46 +70,8 @@ func (s *Server) handleConnection(conn quic.Connection) {
 			return
 		}
 
-		s.processPacket(data)
+		s.stats.ProcessPacket(data)
 	}
-}
-
-func (s *Server) processPacket(data []byte) {
-	if len(data) < 16 { // 8字节序列号 + 8字节时间戳
-		return
-	}
-
-	seqNum := binary.BigEndian.Uint64(data[:8])
-	timestamp := int64(binary.BigEndian.Uint64(data[8:16]))
-	sendTime := time.Unix(0, timestamp)
-
-	now := time.Now()
-	latency := now.Sub(sendTime)
-
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
-	s.stats.ReceivedCount++
-	s.stats.TotalLatency += latency
-
-	if s.stats.MinLatency == 0 || latency < s.stats.MinLatency {
-		s.stats.MinLatency = latency
-	}
-	if latency > s.stats.MaxLatency {
-		s.stats.MaxLatency = latency
-	}
-
-	// 检测丢包
-	if seqNum > s.stats.LastSeqNum+1 {
-		lost := seqNum - s.stats.LastSeqNum - 1
-		s.stats.LostCount += int64(lost)
-		fmt.Printf("检测到丢包: 序列号 %d-%d (丢失 %d 个包)\n",
-			s.stats.LastSeqNum+1, seqNum-1, lost)
-	}
-	s.stats.LastSeqNum = seqNum
-
-	fmt.Printf("收到包 #%d, 延迟: %v, 大小: %d 字节\n",
-		seqNum, latency, len(data))
 }
 
 func (s *Server) printStats() {
@@ -123,42 +79,22 @@ func (s *Server) printStats() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		s.mutex.RLock()
-		stats := s.stats
-		s.mutex.RUnlock()
-
-		if stats.ReceivedCount > 0 {
-			avgLatency := stats.TotalLatency / time.Duration(stats.ReceivedCount)
-			lossRate := float64(stats.LostCount) / float64(stats.ReceivedCount+stats.LostCount) * 100
-
-			fmt.Printf("\n=== 统计信息 ===\n")
-			fmt.Printf("接收包数: %d\n", stats.ReceivedCount)
-			fmt.Printf("丢失包数: %d\n", stats.LostCount)
-			fmt.Printf("丢包率: %.2f%%\n", lossRate)
-			fmt.Printf("平均延迟: %v\n", avgLatency)
-			fmt.Printf("最小延迟: %v\n", stats.MinLatency)
-			fmt.Printf("最大延迟: %v\n", stats.MaxLatency)
-			fmt.Printf("================\n\n")
-		}
+		s.stats.Print()
 	}
 }
 
-func main() {
-	addr := "0.0.0.0:4363"
-
+func runNativeServer(addr string) error {
 	listener, err := quic.ListenAddr(addr, generateTLSConfig(), &quic.Config{
 		EnableDatagrams: true,
 	})
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	defer listener.Close()
 
-	server := &Server{}
+	server := &Server{mode: "native"}
+	fmt.Printf("Native QUIC Datagram 服务器启动，监听地址: %s\n", addr)
 
-	fmt.Printf("QUIC Datagram 服务器启动，监听地址: %s\n", addr)
-
-	// 启动统计信息打印
 	go server.printStats()
 
 	for {
@@ -168,6 +104,85 @@ func main() {
 			continue
 		}
 
-		go server.handleConnection(conn)
+		nativeConn := &NativeConnection{conn: conn}
+		go server.handleConnection(nativeConn)
+	}
+}
+
+func makeDatagramTransport(config *Config) (tpt.Transport, error) {
+	var resetKey quic.StatelessResetKey
+	var tokenKey quic.TokenGeneratorKey
+	connManager, err := quicreuse.NewConnManager(resetKey, tokenKey)
+	if err != nil {
+		return nil, err
+	}
+	return NewDatagramTransport(config.PrivateKey, connManager, nil, nil, nil)
+}
+
+func runLibP2PServer(listenAddr string, config *Config) error {
+	transport, err := makeDatagramTransport(config)
+	if err != nil {
+		return fmt.Errorf("创建transport失败: %w", err)
+	}
+
+	h, err := libp2p.New(
+		libp2p.Identity(config.PrivateKey),
+		libp2p.Transport(func() (tpt.Transport, error) { return transport, nil }),
+		libp2p.ListenAddrStrings(listenAddr),
+		libp2p.DisableRelay(),
+	)
+	if err != nil {
+		return fmt.Errorf("创建libp2p host失败: %w", err)
+	}
+	defer h.Close()
+
+	server := &Server{mode: "libp2p"}
+	
+	fmt.Printf("LibP2P QUIC Datagram 服务器启动\n")
+	fmt.Printf("Peer ID: %s\n", h.ID())
+	fmt.Printf("监听地址:\n")
+	for _, addr := range h.Addrs() {
+		fmt.Printf("  %s/p2p/%s\n", addr, h.ID())
+	}
+
+	// 设置连接通知器
+	notifee := &network.NotifyBundle{
+		ConnectedF: func(n network.Network, conn network.Conn) {
+			fmt.Printf("新连接来自: %s\n", conn.RemotePeer())
+			libp2pConn, err := NewLibP2PConnection(conn)
+			if err != nil {
+				fmt.Printf("创建LibP2P连接失败: %v\n", err)
+				return
+			}
+			go server.handleConnection(libp2pConn)
+		},
+	}
+	h.Network().Notify(notifee)
+
+	go server.printStats()
+
+	// 保持运行
+	select {}
+}
+
+func runServer() {
+	mode := flag.String("mode", "native", "连接模式: native 或 libp2p")
+	addr := flag.String("addr", "0.0.0.0:4363", "监听地址 (native模式)")
+	listenAddr := flag.String("listen", "/ip4/0.0.0.0/udp/4363/quic-v1", "监听地址 (libp2p模式)")
+	flag.Parse()
+
+	var err error
+	if *mode == "libp2p" {
+		config, err := LoadOrCreateConfig()
+		if err != nil {
+			log.Fatalf("加载配置失败: %v", err)
+		}
+		err = runLibP2PServer(*listenAddr, config)
+	} else {
+		err = runNativeServer(*addr)
+	}
+
+	if err != nil {
+		log.Fatal(err)
 	}
 }

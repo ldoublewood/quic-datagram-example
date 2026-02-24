@@ -1,3 +1,9 @@
 /bin
 .idea/
 .vscode/
+*.log
+/tmp/
+*.test
+*.out
+.DS_Store
+.ref

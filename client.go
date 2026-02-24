@@ -3,39 +3,36 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"encoding/binary"
 	"flag"
 	"fmt"
 	"log"
-	"math/rand"
-	"sync"
 	"time"
 
+	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
+	tpt "github.com/libp2p/go-libp2p/core/transport"
+	ma "github.com/multiformats/go-multiaddr"
 	"github.com/quic-go/quic-go"
 )
 
 type ClientConfig struct {
+	Mode        string
 	ServerAddr  string
+	PeerAddr    string // libp2p模式下的multiaddr
 	PacketSize  int
-	SendRate    int // 每秒发送包数
+	SendRate    int
 	Duration    time.Duration
-	PayloadType string // "random" 或 "sequential"
-}
-
-type ClientStats struct {
-	SentCount  int64
-	ErrorCount int64
-	StartTime  time.Time
-	mutex      sync.RWMutex
+	PayloadType string
 }
 
 type Client struct {
-	conn   quic.Connection
+	conn   Connection
 	config ClientConfig
 	stats  ClientStats
 }
 
-func (c *Client) connect() error {
+func (c *Client) connectNative() error {
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"quic-datagram-test"},
@@ -48,37 +45,67 @@ func (c *Client) connect() error {
 		return err
 	}
 
-	c.conn = conn
+	c.conn = &NativeConnection{conn: conn}
 	c.stats.StartTime = time.Now()
 	return nil
 }
 
-func (c *Client) generatePayload(seqNum uint64) []byte {
-	payload := make([]byte, c.config.PacketSize)
-
-	// 前8字节：序列号
-	binary.BigEndian.PutUint64(payload[:8], seqNum)
-
-	// 接下来8字节：时间戳（纳秒）
-	timestamp := time.Now().UnixNano()
-	binary.BigEndian.PutUint64(payload[8:16], uint64(timestamp))
-
-	// 剩余部分：根据配置生成数据
-	switch c.config.PayloadType {
-	case "random":
-		rand.Read(payload[16:])
-	case "sequential":
-		for i := 16; i < len(payload); i++ {
-			payload[i] = byte(i % 256)
-		}
-	default:
-		// 默认填充固定模式
-		for i := 16; i < len(payload); i++ {
-			payload[i] = byte(seqNum % 256)
-		}
+func (c *Client) connectLibP2P(config *Config) error {
+	transport, err := makeDatagramTransport(config)
+	if err != nil {
+		return fmt.Errorf("创建transport失败: %w", err)
 	}
 
-	return payload
+	h, err := libp2p.New(
+		libp2p.Identity(config.PrivateKey),
+		libp2p.Transport(func() (tpt.Transport, error) { return transport, nil }),
+		libp2p.ListenAddrStrings("/ip4/0.0.0.0/udp/0/quic-v1"),
+		libp2p.DisableRelay(),
+	)
+	if err != nil {
+		return fmt.Errorf("创建libp2p host失败: %w", err)
+	}
+
+	fmt.Printf("本地 Peer ID: %s\n", h.ID())
+
+	// 解析目标地址
+	targetAddr, err := ma.NewMultiaddr(c.config.PeerAddr)
+	if err != nil {
+		return fmt.Errorf("解析目标地址失败: %w", err)
+	}
+
+	// 提取peer ID
+	addrInfo, err := peer.AddrInfoFromP2pAddr(targetAddr)
+	if err != nil {
+		return fmt.Errorf("提取peer信息失败: %w", err)
+	}
+
+	// 添加到peerstore
+	h.Peerstore().AddAddrs(addrInfo.ID, addrInfo.Addrs, peerstore.PermanentAddrTTL)
+
+	// 连接到对等节点
+	fmt.Printf("正在连接到: %s\n", addrInfo.ID)
+	if err := h.Connect(context.Background(), *addrInfo); err != nil {
+		return fmt.Errorf("连接失败: %w", err)
+	}
+
+	// 等待连接建立
+	time.Sleep(500 * time.Millisecond)
+
+	// 获取连接
+	conns := h.Network().ConnsToPeer(addrInfo.ID)
+	if len(conns) == 0 {
+		return fmt.Errorf("未找到到目标节点的连接")
+	}
+
+	libp2pConn, err := NewLibP2PConnection(conns[0])
+	if err != nil {
+		return fmt.Errorf("创建LibP2P连接失败: %w", err)
+	}
+
+	c.conn = libp2pConn
+	c.stats.StartTime = time.Now()
+	return nil
 }
 
 func (c *Client) sendPackets() {
@@ -96,18 +123,14 @@ func (c *Client) sendPackets() {
 	for time.Now().Before(endTime) {
 		select {
 		case <-ticker.C:
-			payload := c.generatePayload(seqNum)
+			payload := GeneratePayload(seqNum, c.config.PacketSize, c.config.PayloadType)
 
 			err := c.conn.SendDatagram(payload)
 			if err != nil {
-				c.stats.mutex.Lock()
-				c.stats.ErrorCount++
-				c.stats.mutex.Unlock()
+				c.stats.IncrementError()
 				fmt.Printf("发送包 #%d 失败: %v\n", seqNum, err)
 			} else {
-				c.stats.mutex.Lock()
-				c.stats.SentCount++
-				c.stats.mutex.Unlock()
+				c.stats.IncrementSent()
 
 				if seqNum%100 == 0 {
 					fmt.Printf("已发送 %d 个包\n", seqNum)
@@ -121,26 +144,12 @@ func (c *Client) sendPackets() {
 	}
 }
 
-func (c *Client) printFinalStats() {
-	c.stats.mutex.RLock()
-	defer c.stats.mutex.RUnlock()
-
-	duration := time.Since(c.stats.StartTime)
-	actualRate := float64(c.stats.SentCount) / duration.Seconds()
-
-	fmt.Printf("\n=== 客户端发送统计 ===\n")
-	fmt.Printf("发送包数: %d\n", c.stats.SentCount)
-	fmt.Printf("发送错误: %d\n", c.stats.ErrorCount)
-	fmt.Printf("实际发送速率: %.2f pps\n", actualRate)
-	fmt.Printf("总发送时间: %v\n", duration)
-	fmt.Printf("总数据量: %.2f MB\n", float64(c.stats.SentCount*int64(c.config.PacketSize))/1024/1024)
-	fmt.Printf("=====================\n")
-}
-
-func main() {
+func runClient() {
 	var config ClientConfig
 
-	flag.StringVar(&config.ServerAddr, "server", "localhost:8080", "服务器地址")
+	flag.StringVar(&config.Mode, "mode", "native", "连接模式: native 或 libp2p")
+	flag.StringVar(&config.ServerAddr, "server", "localhost:4363", "服务器地址 (native模式)")
+	flag.StringVar(&config.PeerAddr, "peer", "", "对等节点multiaddr (libp2p模式)")
 	flag.IntVar(&config.PacketSize, "size", 1024, "数据包大小（字节）")
 	flag.IntVar(&config.SendRate, "rate", 100, "发送速率（包/秒）")
 	flag.DurationVar(&config.Duration, "duration", 30*time.Second, "发送持续时间")
@@ -149,11 +158,28 @@ func main() {
 
 	client := &Client{config: config}
 
-	fmt.Printf("连接到服务器: %s\n", config.ServerAddr)
-	if err := client.connect(); err != nil {
-		log.Fatal("连接失败:", err)
+	var err error
+	if config.Mode == "libp2p" {
+		if config.PeerAddr == "" {
+			log.Fatal("libp2p模式需要指定 -peer 参数")
+		}
+		
+		cfg, err := LoadOrCreateConfig()
+		if err != nil {
+			log.Fatalf("加载配置失败: %v", err)
+		}
+
+		fmt.Printf("使用LibP2P模式连接到: %s\n", config.PeerAddr)
+		if err := client.connectLibP2P(cfg); err != nil {
+			log.Fatal("连接失败:", err)
+		}
+	} else {
+		fmt.Printf("使用Native模式连接到服务器: %s\n", config.ServerAddr)
+		if err = client.connectNative(); err != nil {
+			log.Fatal("连接失败:", err)
+		}
 	}
-	defer client.conn.CloseWithError(0, "")
+	defer client.conn.Close()
 
 	fmt.Printf("连接成功，开始性能测试...\n")
 
@@ -164,7 +190,7 @@ func main() {
 	time.Sleep(100 * time.Millisecond)
 
 	// 打印最终统计
-	client.printFinalStats()
+	client.stats.PrintFinal(config.PacketSize)
 
 	fmt.Printf("测试完成，保持连接5秒以查看服务器统计...\n")
 	time.Sleep(5 * time.Second)
